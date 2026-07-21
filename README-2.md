@@ -6,7 +6,7 @@
 **Student:** Mahmuda Akter  
 **Issue:** https://github.com/carlos-emr/carlos/issues/2821
 **Fork Link:** (https://github.com/makter20/carlos)
-**Status:** Phase I
+**Status:** Phase II — implemented, unit-tested, and validated live on a local dev build (commit `978b60ae2d`); not yet pushed / no PR opened
 
 ## Why I Chose This Issue
 
@@ -51,7 +51,7 @@ I opened the project inside the Docker devcontainer. The MariaDB database runs i
 This is a runtime authorization bug, so reproducing it means logging in as one provider and successfully writing a **different** provider's settings. Attacker = `carlosdoc` (provider `999998`); victim = provider `1` (which starts with no saved settings).
 
 1. Log in at `http://localhost:8080/carlos/index` as `carlosdoc` / `carlos2026` / PIN `2026`.
-2. Open the browser Developer Tools Console (right-click the page → Inspect → Console tab).
+2. Open the browser Developer Tools Console (right-click the page -> Inspect -> Console tab).
 3. Paste and run (note the victim number `1` in the URL):
    ```js
    fetch("/carlos/ws/rs/providerService/settings/1/save", {
@@ -125,9 +125,25 @@ Using UMPIRE framework (adapted):
 
 **Implement:** (https://github.com/makter20/carlos/tree/fix/issue-2821-provider-settings-idor)
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+The fix was implemented on branch `fix/issue-2821-provider-settings-idor` in three files:
 
-**Evaluate:** [How will you verify it works?]
+- `ProviderService.java` — injected `SecurityInfoManager`, imported `LoggedInInfo`, rewrote `saveProviderSettings` to derive identity from the session and enforce self-or-`_admin`, and removed the `WARN` settings log.
+- `ProviderManager2.java` — added the same self-or-admin guard at the top of `updateProviderSettings` (defense in depth) plus a sanitized `LogAction.addLogSynchronous(loggedInInfo, "ProviderManager.updateProviderSettings", providerNo)` audit entry (target provider only, no settings values).
+- `ProviderServiceUnitTest.java` — new unit test covering the four authorization branches.
+
+One deviation from the original plan: I planned to add the audit via `OscarLogManager`, but that interface is query-only (it just reads "recent demographics viewed") and has no audit-write method. The correct, idiomatic tool is `LogAction.addLogSynchronous`, which the sibling `updateProvider` method already uses, so I used that instead.
+
+**Review:** Self-review against the project's contribution guidelines:
+
+- [x] Authorization via `SecurityInfoManager.hasPrivilege(...)` on every write path (REST + manager).
+- [x] `SecurityException` message uses the paren form `missing required sec object (_admin)` and leaks no `providerNo` or payload to the client.
+- [x] No PHI / PHI-adjacent data written to logs (removed the `WARN` settings dump; the audit records only the target provider number).
+- [x] New namespace (`io.github.carlos_emr.carlos.*`) and layer/name conventions preserved.
+- [x] Unit tests follow the JUnit 5 + BDD naming convention and reuse the existing `EFormServiceUnitTest` harness style.
+- [x] No parameterized-query / path-traversal surface changed (none in this flow).
+- [ ] Open decision: denial currently surfaces as HTTP 500 (thrown `SecurityException`); a 403 would be cleaner REST semantics — see Learnings.
+
+**Evaluate:** Verified by (a) rebuilding and redeploying the fixed build and re-running the exact live exploit — it is now blocked with no database change, while a legitimate self-save and a legitimate admin save both still succeed; and (b) the new unit tests, which pass and were confirmed meaningful with a manual mutation check (see Testing Strategy).
 
 ---
 
@@ -135,51 +151,82 @@ Using UMPIRE framework (adapted):
 
 ### Unit Tests
 
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
+New class: `src/test/java/io/github/carlos_emr/carlos/webserv/rest/ProviderServiceUnitTest.java` (JUnit 5, Mockito, extends `CarlosUnitTestBase`; testable subclass overrides `getLoggedInInfo()` and injects mocked `ProviderManager2` / `SecurityInfoManager`). All four pass (`tests=4, failures=0, errors=0`):
+
+- [x] `shouldSaveSettings_whenProviderEditsOwnSettings` — caller edits their own provider number; the manager is invoked (self-service still works).
+- [x] `shouldThrowSecurityException_whenNonAdminEditsAnotherProvider` — non-admin targets another provider; throws `SecurityException` and the manager is **never** called (the IDOR is blocked).
+- [x] `shouldSaveSettings_whenAdminEditsAnotherProvider` — caller with `_admin` write targets another provider; allowed by design.
+- [x] `shouldThrowSecurityException_whenSessionProviderIsNull` — no session provider; fails closed (throws, manager never called).
+
+**Mutation sanity check:** I temporarily disabled the authorization guard in the production code and re-ran the suite. The two deny-path tests failed (`tests=4, failures=2`) while the two allow-path tests still passed, and re-enabling the guard returned all four to green. This confirms the tests genuinely assert the security behavior rather than passing trivially.
 
 ### Integration Tests
 
-- [ ] Integration scenario 1
-- [ ] Integration scenario 2
+- [x] End-to-end HTTP validation on a running Tomcat + MariaDB build (documented under Manual Testing). This covers the real routing (`/ws/rs`), the `AuthenticationInInterceptor` session gate, and the database effect.
+- [ ] No automated (in-repo) integration test was added. The endpoint's session/authorization behavior is exercised manually and by the unit tests; an automated CXF-level integration test is a possible follow-up.
 
 ### Manual Testing
 
-[What you tested manually and results]
+I validated before and after the fix on a real deployed build (attacker = provider 999998, victim = provider 1):
+
+| Scenario             | Account                  | Request                     | Vulnerable build                 | Fixed build                                                      |
+| -------------------- | ------------------------ | --------------------------- | -------------------------------- | ---------------------------------------------------------------- |
+| Attack (the IDOR)    | non-admin 999998         | `POST settings/1/save`      | HTTP 200, provider 1 overwritten | **HTTP 500 / SecurityException, provider 1 unchanged (blocked)** |
+| Legitimate self-save | 999998                   | `POST settings/999998/save` | HTTP 200                         | **HTTP 200 SUCCESS**                                             |
+| Admin edits another  | 999998 with `admin` role | `POST settings/1/save`      | HTTP 200                         | **HTTP 200 SUCCESS (allowed by design)**                         |
+
+To test the non-admin deny path I temporarily removed carlosdoc's `admin` role (the dev account has both `doctor` and `admin`), then restored it afterward. All injected test data on provider 1 was cleaned up.
 
 ---
 
 ## Implementation Notes
 
-### Week [X] Progress
-
-[What you built this week, challenges faced, decisions made]
-
-### Week [Y] Progress
-
-[Continue documenting as you work]
-
 ### Code Changes
 
-- **Files modified:** [List]
-- **Key commits:** [Links to important commits]
-- **Approach decisions:** [Why you chose certain approaches]
+- **Files modified:**
+  - `src/main/java/io/github/carlos_emr/carlos/webserv/rest/ProviderService.java`
+  - `src/main/java/io/github/carlos_emr/carlos/managers/ProviderManager2.java`
+  - `src/test/java/io/github/carlos_emr/carlos/webserv/rest/ProviderServiceUnitTest.java` (new)
+- **Key commit:** `978b60ae2d` — "fix: add authorization to provider settings save (IDOR)" (3 files changed, +211/-2) on branch `fix/issue-2821-provider-settings-idor`.
+- **Approach decisions:**
+  - Identity is taken from the session, never the URL path — the path `providerNo` is treated as the target, and the caller must own it or be an admin.
+  - Reused the existing `_admin` write privilege and the `hasPrivilege` pattern already used elsewhere in `ProviderManager2`, rather than inventing a new security object.
+  - Added the check in both the REST action and the manager so a future caller of the manager cannot reintroduce the IDOR.
+  - Used `LogAction.addLogSynchronous` for the audit (not `OscarLogManager`, which is query-only), matching the sibling `updateProvider` audit.
+
+### Remaining before opening the PR
+
+- Run the full unit suite (`make install --run-unit-tests`) and confirm CI checks are green (only the focused test was run so far).
+- Push the branch and open the PR against `develop`.
 
 ---
 
 ## Pull Request
 
-**PR Link:** [GitHub PR URL when submitted]
+**PR Link:** Not yet opened (branch committed locally; push pending).
 
-**PR Description:** [Draft or final PR description - much of the content above can be adapted]
+**PR Description (draft):**
+
+> **fix: add authorization to provider settings save (IDOR) — fixes #2821**
+>
+> `ProviderService.saveProviderSettings` accepted the target `providerNo` from the URL path and saved settings for that provider with only a login check, so any authenticated session could overwrite any provider's settings (IDOR). It also logged the full settings object at `WARN`.
+>
+> This change:
+>
+> - derives the caller identity from the session (`getLoggedInProviderNo()`), never the request path;
+> - allows a provider to edit only their own settings, and requires `_admin` write (`SecurityInfoManager.hasPrivilege`) to edit another provider's settings, failing closed on a null session and denying with a paren-form `SecurityException` that leaks no identifiers;
+> - removes the `WARN` log of the settings object;
+> - applies the same check inside `ProviderManager2.updateProviderSettings` (defense in depth) with a sanitized `LogAction` audit;
+> - adds `ProviderServiceUnitTest` covering self-edit (allowed), non-admin cross-provider (denied), admin cross-provider (allowed), and null-session (fails closed).
+>
+> Validated live: the exploit is now blocked with no DB change, while legitimate self-service and admin saves still succeed.
 
 **Maintainer Feedback:**
 
 - [Date]: [Summary of feedback received]
 - [Date]: [How you addressed it]
 
-**Status:** [Awaiting review / Iterating / Approved / Merged]
+**Status:** Not yet submitted — local commit ready, push and PR pending.
 
 ---
 
@@ -187,20 +234,28 @@ Using UMPIRE framework (adapted):
 
 ### Technical Skills Gained
 
-[What you learned technically]
+- Recognizing and fixing an IDOR: the core lesson is to derive the acted-on identity from the authenticated session, not from client-supplied input, and to enforce ownership/role at every layer.
+- How CARLOS wires its REST layer: CXF JAX-RS services under `/ws/rs`, the `AuthenticationInInterceptor` session gate, the OAuth interceptor's session fallback, and how CSRFGuard's unprotected-page config (`/ws/*`) affects reachability.
+- Using the project's `SecurityInfoManager.hasPrivilege` authorization model and its security objects (e.g. `_admin`).
+- Verifying a fix at multiple levels: reading bytecode with `javap`, live HTTP before/after testing against a real DB, focused JUnit 5 + Mockito unit tests, and a manual mutation check to prove the tests are meaningful.
 
 ### Challenges Overcome
 
-[What was hard and how you solved it]
+- The pre-deployed webapp was stale and failed to start (missing `Owasp.CsrfGuard.properties`); I had to rebuild/redeploy to get a faithful target.
+- Finding the real endpoint path: the services are served under `/ws/rs`, while `/ws/services` is only CXF's listing page.
+- The default dev account (`carlosdoc`) has both `doctor` and `admin` roles, so it was authorized under the fix — I had to temporarily reduce it to a non-admin role to prove the deny path, then restore it.
+- A hot-reload watcher started by `make install` corrupted incremental compilation of the tests; stopping it and doing a clean compile resolved it.
 
 ### What I'd Do Differently Next Time
 
-[Reflection on your process]
+- Decide the denial HTTP semantics up front. The fix throws `SecurityException`, which surfaces as HTTP 500; a 403 Forbidden would be cleaner for an authorization failure, though 500 matches how other CARLOS REST services signal denials today.
+- Consider an automated integration test for the endpoint's auth, so the live validation I did by hand is captured in CI.
 
 ---
 
 ## Resources Used
 
-- [Link to helpful documentation]
-- [Tutorial or Stack Overflow post that helped]
-- [GitHub issues or discussions that helped]
+- CARLOS `CLAUDE.md` — security requirements (`SecurityInfoManager.hasPrivilege`, paren-form `SecurityException`, no PHI in logs) and the test-writing conventions.
+- Existing code patterns: `PersonaService.updatePreference` (session-scoped, privilege-checked save) and `EFormServiceUnitTest` (REST unit-test harness).
+- OWASP — Insecure Direct Object Reference (IDOR) and CWE-639 (Authorization Bypass Through User-Controlled Key).
+- GitHub issue #2821.
